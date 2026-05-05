@@ -1,0 +1,902 @@
+import sqlite3
+import random
+import time
+import asyncio
+import traceback
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from datetime import datetime
+
+# --- DATABASE INITIALIZATION ---
+
+def setup_db():
+    """Initializes the SQLite database and creates all necessary tables."""
+    conn = sqlite3.connect('football_rpg.db')
+    c = conn.cursor()
+
+    # Table for Club information and finances
+    c.execute('''CREATE TABLE IF NOT EXISTS clubs (
+        user_id INTEGER PRIMARY KEY,
+        club_name TEXT,
+        stadium_name TEXT,
+        balance INTEGER DEFAULT 1000000,
+        training_lvl INTEGER DEFAULT 3,
+        formation TEXT DEFAULT '4-4-2'
+    )''')
+
+    # Table for Players (Core RPG Data)
+    # status codes: 0=Reserve, 1=Starter, 2=Bench, 3=Transfer Listed
+    c.execute('''CREATE TABLE IF NOT EXISTS players (
+        player_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        name TEXT,
+        age INTEGER DEFAULT 18,
+        position TEXT,
+        status INTEGER DEFAULT 0, 
+        injury_days INTEGER DEFAULT 0,
+        training_until INTEGER DEFAULT 0,
+        cooldown_until INTEGER DEFAULT 0,
+        stat_shooting INTEGER,
+        stat_dribbling INTEGER,
+        stat_keeping INTEGER,
+        stat_crossing INTEGER,
+        stat_passing INTEGER,
+        stat_aerial INTEGER,
+        stat_technique INTEGER,
+        stat_tackling INTEGER,
+        FOREIGN KEY(owner_id) REFERENCES clubs(user_id)
+    )''')
+
+    # Table for League Standings
+    c.execute('''CREATE TABLE IF NOT EXISTS leagues (
+        guild_id INTEGER,
+        user_id INTEGER,
+        points INTEGER DEFAULT 0,
+        played INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        draws INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        goals_for INTEGER DEFAULT 0,
+        goals_against INTEGER DEFAULT 0,
+        PRIMARY KEY (guild_id, user_id)
+    )''')
+
+    conn.commit()
+    return conn, c
+
+# Initialize connection and cursor global variables
+conn, c = setup_db()
+
+# --- BOT CLASS DEFINITION ---
+
+class FootballBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.message_content = True
+        # Using a standard prefix for non-slash commands if needed
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        """Runs when the bot starts up."""
+        # Start the background maintenance loop
+        if not daily_maintenance.is_running():
+            daily_maintenance.start()
+        
+        # Sync slash commands with Discord
+        await self.tree.sync()
+        print(f"Synced slash commands for {self.user}")
+
+bot = FootballBot()
+
+# Note: The daily_maintenance task is defined in Segment 8
+# --- CORE LOGIC FUNCTIONS ---
+
+def talent_suffix():
+    """Generates a random suffix for player names to add variety."""
+    return random.choice(["Jr.", "Sr.", "II", "III", "IV", "V", ""])
+
+def calculate_ovr(p):
+    """
+    Calculates the Overall (OVR) rating based on position-specific stats.
+    Database indices for stats: 
+    9:shooting, 10:dribbling, 11:keeping, 12:crossing, 
+    13:passing, 14:aerial, 15:technique, 16:tackling
+    """
+    pos = p[4]
+    try:
+        if pos == 'GK':
+            # Goalkeepers rely heavily on Keeping and Technique
+            return int((p[11] * 0.8) + (p[15] * 0.2))
+        elif pos in ['CB', 'LB', 'RB']:
+            # Defenders rely on Tackling, Aerial, and Passing
+            return int((p[16] * 0.6) + (p[14] * 0.2) + (p[13] * 0.2))
+        elif pos in ['CM', 'LM', 'RM']:
+            # Midfielders rely on Passing, Technique, and Dribbling
+            return int((p[13] * 0.4) + (p[15] * 0.3) + (p[10] * 0.3))
+        elif pos in ['ST', 'LW', 'RW']:
+            # Attackers rely on Shooting, Dribbling, and Technique
+            return int((p[9] * 0.6) + (p[10] * 0.2) + (p[15] * 0.2))
+    except (IndexError, TypeError):
+        return 50 # Default if data is missing
+    return 50
+
+def generate_player(owner_id, position=None):
+    """Creates a new player and saves them to the database."""
+    if not position:
+        position = random.choice(['GK', 'CB', 'LB', 'RB', 'CM', 'LM', 'RM', 'ST', 'LW', 'RW'])
+    
+    # Generate base stats (randomized 30-60)
+    stats = {k: random.randint(30, 60) for k in [
+        'shooting', 'dribbling', 'keeping', 'crossing', 
+        'passing', 'aerial', 'technique', 'tackling'
+    ]}
+    
+    # Boost primary stats based on position
+    if position == 'GK':
+        stats['keeping'] = random.randint(65, 85)
+    elif position == 'ST':
+        stats['shooting'] = random.randint(65, 85)
+    elif position in ['CB', 'LB', 'RB']:
+        stats['tackling'] = random.randint(65, 85)
+    
+    # Randomized Name Generation
+    first_names = ["Leo", "Cristiano", "Kylian", "Kevin", "Erling", "Mohamed", "Virgil", "Luka", "Neymar", "Harry"]
+    last_names = ["Silva", "Ronaldo", "Messi", "Mbappe", "De Bruyne", "Haaland", "Salah", "Van Dijk", "Modric", "Kane"]
+    full_name = f"{random.choice(first_names)} {random.choice(last_names)} {talent_suffix()}".strip()
+    
+    age = random.randint(17, 24) # New players are generally young
+
+    c.execute('''INSERT INTO players (
+        owner_id, name, age, position, 
+        stat_shooting, stat_dribbling, stat_keeping, stat_crossing, 
+        stat_passing, stat_aerial, stat_technique, stat_tackling
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+    (owner_id, full_name, age, position, 
+     stats['shooting'], stats['dribbling'], stats['keeping'], stats['crossing'], 
+     stats['passing'], stats['aerial'], stats['technique'], stats['tackling']))
+    conn.commit()
+
+# --- 7.1 AGEING & RETIREMENT LOGIC ---
+
+def process_retirement(p_id, p_name, p_age):
+    """
+    Determines if a player retires based on their age.
+    Called inside the daily_maintenance loop (Segment 8).
+    """
+    if p_age >= 34:
+        # Probability of retirement increases with age
+        # 34: 20%, 35: 40%, 36: 60%, 37: 80%, 38: 100%
+        retirement_chance = (p_age - 33) * 0.2
+        if random.random() < retirement_chance:
+            c.execute("DELETE FROM players WHERE player_id = ?", (p_id,))
+            print(f"👟 RETIREMENT: {p_name} has retired at age {p_age}.")
+            return True
+    return False
+def get_player_price(player_id):
+    """
+    Calculates a dynamic price based on the player's OVR.
+    Base price for 70 OVR is ~$250k. 80+ OVR can cost $1M+.
+    """
+    c.execute("SELECT * FROM players WHERE player_id = ?", (player_id,))
+    p = c.fetchone()
+    if not p: return 250000
+    
+    ovr = calculate_ovr(p)
+    
+    if ovr >= 80:
+        # High-tier players cost significantly more
+        return int(500000 + ((ovr - 79) * 150000))
+    elif ovr >= 70:
+        # Standard mid-tier pricing
+        return int(200000 + ((ovr - 69) * 25000))
+    else:
+        # Budget players
+        return 150000
+
+def generate_prodigy(owner_id):
+    """
+    A special version of the generator that hits the 80-85 OVR range.
+    5% chance to be called by the scout or market refresh.
+    """
+    position = random.choice(['GK', 'CB', 'LB', 'RB', 'CM', 'LM', 'RM', 'ST', 'LW', 'RW'])
+    
+    # Higher base stats for Prodigies
+    stats = {k: random.randint(70, 78) for k in [
+        'shooting', 'dribbling', 'keeping', 'crossing', 
+        'passing', 'aerial', 'technique', 'tackling'
+    ]}
+    
+    # High boost for primary stat
+    boost = random.randint(82, 88)
+    if position == 'GK': stats['keeping'] = boost
+    elif position == 'ST': stats['shooting'] = boost
+    elif position in ['CB', 'LB', 'RB']: stats['tackling'] = boost
+
+    name = f"{random.choice(['Wonder', 'Young', 'Star'])} Prospect {random.randint(1, 99)}"
+    
+    c.execute('''INSERT INTO players (
+        owner_id, name, age, position, 
+        stat_shooting, stat_dribbling, stat_keeping, stat_crossing, 
+        stat_passing, stat_aerial, stat_technique, stat_tackling
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+    (owner_id, name, random.randint(16, 18), position, 
+     stats['shooting'], stats['dribbling'], stats['keeping'], stats['crossing'], 
+     stats['passing'], stats['aerial'], stats['technique'], stats['tackling']))
+    conn.commit()
+# --- CLUB CREATION & FINANCE COMMANDS ---
+
+class StartClubModal(discord.ui.Modal, title='Setup Your Football Club'):
+    """A pop-up window for users to enter their club details."""
+    club_n = discord.ui.TextInput(
+        label='Club Name', 
+        placeholder='e.g., Manchester United',
+        min_length=3,
+        max_length=30
+    )
+    stadium_n = discord.ui.TextInput(
+        label='Stadium Name', 
+        placeholder='e.g., Old Trafford',
+        min_length=3,
+        max_length=30
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        
+        # Check if the user already has a club entry
+        c.execute("SELECT user_id FROM clubs WHERE user_id = ?", (user_id,))
+        if c.fetchone():
+            return await interaction.response.send_message(
+                "❌ You already own a club! Manage it using `/lineup`.", 
+                ephemeral=True
+            )
+
+        # 1. Insert the new club into the database (Starting balance: $1M)
+        c.execute(
+            "INSERT INTO clubs (user_id, club_name, stadium_name, balance) VALUES (?, ?, ?, ?)",
+            (user_id, self.club_n.value, self.stadium_n.value, 1000000)
+        )
+        
+        # 2. Generate a balanced starting squad of 20 players
+        # Guarantee 2 Goalkeepers
+        for _ in range(2):
+            generate_player(user_id, position='GK')
+        
+        # Generate 18 more players of random positions
+        for _ in range(18):
+            generate_player(user_id)
+
+        conn.commit()
+        
+        # 3. Confirmation Message
+        embed = discord.Embed(
+            title="🎉 Club Established!", 
+            description=f"Congratulations, **{interaction.user.name}**!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Club Name", value=self.club_n.value, inline=True)
+        embed.add_field(name="Stadium", value=self.stadium_n.value, inline=True)
+        embed.add_field(name="Starting Squad", value="20 Players generated and assigned to Reserves.", inline=False)
+        embed.set_footer(text="Use /lineup to set your Starters (11) and Bench (7).")
+
+        await interaction.response.send_message(embed=embed)
+
+# --- SLASH COMMANDS ---
+
+@bot.tree.command(name="startmyclub", description="Create your football club and get your 20-man squad")
+async def startmyclub(interaction: discord.Interaction):
+    """Triggers the modal for club creation."""
+    await interaction.response.send_modal(StartClubModal())
+
+@bot.tree.command(name="balance", description="Check your club's bank balance and stadium info")
+async def balance(interaction: discord.Interaction):
+    """Displays the user's current finances and stadium name (7.3)."""
+    user_id = interaction.user.id
+    
+    c.execute("SELECT club_name, stadium_name, balance FROM clubs WHERE user_id = ?", (user_id,))
+    club = c.fetchone()
+    
+    if not club:
+        return await interaction.response.send_message(
+            "❌ You don't have a club yet! Use `/startmyclub` to begin.", 
+            ephemeral=True
+        )
+
+    embed = discord.Embed(
+        title=f"💳 {club[0]} - Financial Report", 
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Stadium", value=f"🏟️ {club[1]}", inline=False)
+    embed.add_field(name="Bank Balance", value=f"💰 **${club[2]:,}**", inline=False)
+    
+    # Simple flavor text based on balance
+    if club[2] > 2000000:
+        status = "Wealthy"
+    elif club[2] > 500000:
+        status = "Stable"
+    else:
+        status = "Financial Risk"
+        
+    embed.set_footer(text=f"Club Status: {status}")
+    await interaction.response.send_message(embed=embed)
+# --- TRAINING SYSTEM ---
+
+@bot.tree.command(name="train", description="Train a player (5m session, 1h rest)")
+@app_commands.describe(player_id="The ID of the player to train")
+async def train(interaction: discord.Interaction, player_id: int):
+    user_id = interaction.user.id
+    now = int(time.time())
+
+    # 1. Fetch Club and Training Level
+    c.execute("SELECT training_lvl FROM clubs WHERE user_id = ?", (user_id,))
+    club = c.fetchone()
+    if not club:
+        return await interaction.response.send_message("❌ You don't have a club! Use `/startmyclub`.", ephemeral=True)
+
+    train_lvl = club[0]
+    
+    # 2. Determine Training Slots (Level 1-5: 1, Level 6-10: 3, Level 11+: 5)
+    max_slots = 1 if train_lvl <= 5 else (3 if train_lvl <= 10 else 5)
+    
+    # 3. Check current active training sessions
+    c.execute("SELECT COUNT(*) FROM players WHERE owner_id = ? AND training_until > ?", (user_id, now))
+    active_count = c.fetchone()[0]
+    
+    if active_count >= max_slots:
+        return await interaction.response.send_message(
+            f"❌ Your Training Center is at capacity ({active_count}/{max_slots} slots). Wait for a session to finish!", 
+            ephemeral=True
+        )
+
+    # 4. Fetch Player Data
+    c.execute("SELECT * FROM players WHERE player_id = ? AND owner_id = ?", (player_id, user_id))
+    p = c.fetchone()
+    
+    if not p:
+        return await interaction.response.send_message("❌ Player not found or doesn't belong to you.", ephemeral=True)
+
+    # Database indices: name(2), age(3), training_until(7), cooldown_until(8)
+    if p[7] > now:
+        rem = (p[7] - now) // 60
+        return await interaction.response.send_message(f"🏃 **{p[2]}** is still on the pitch! ({rem}m left)", ephemeral=True)
+    
+    if p[8] > now:
+        rem = (p[8] - now) // 60
+        return await interaction.response.send_message(f"😴 **{p[2]}** is exhausted. They need {rem}m more rest.", ephemeral=True)
+
+    # 5. Determine Stat Gain (Buffs for youth)
+    # Young players (<=23) get +2, older players get +1
+    stat_gain = 2 if p[3] <= 23 else 1
+    
+    # Randomly select a stat to improve (using your original stat columns)
+    stat_options = ["stat_shooting", "stat_dribbling", "stat_crossing", "stat_passing", "stat_aerial", "stat_technique", "stat_tackling"]
+    if p[4] == 'GK': stat_options.append("stat_keeping")
+    
+    chosen_stat = random.choice(stat_options)
+    
+    # 6. Update Timestamps and Stats
+    t_end = now + 300      # 5 Minutes (300 seconds)
+    c_end = t_end + 3600   # 1 Hour rest (3600 seconds) after training ends
+    
+    c.execute(f"UPDATE players SET {chosen_stat} = {chosen_stat} + ?, training_until = ?, cooldown_until = ? WHERE player_id = ?",
+              (stat_gain, t_end, c_end, player_id))
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"🏋️ **{p[2]}** has started an intensive session for **{chosen_stat.replace('stat_', '')}**!\n"
+        f"⏱️ Training finishes in 5 minutes.\n"
+        f"📈 Gain: +{stat_gain} stat points (Level {train_lvl} Academy)."
+    )
+
+@bot.tree.command(name="academy_status", description="See who is training and resting")
+async def academy_status(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    now = int(time.time())
+    
+    c.execute("SELECT name, training_until, cooldown_until FROM players WHERE owner_id = ? AND (training_until > ? OR cooldown_until > ?)", 
+              (user_id, now, now))
+    busy_players = c.fetchall()
+    
+    if not busy_players:
+        return await interaction.response.send_message("✅ All players are available and rested.")
+
+    status_report = "**Current Academy Status:**\n"
+    for name, t_until, c_until in busy_players:
+        if t_until > now:
+            status_report += f"• {name}: 🏃 Training ({ (t_until - now)//60 }m left)\n"
+        else:
+            status_report += f"• {name}: 😴 Resting ({ (c_until - now)//60 }m left)\n"
+            
+    await interaction.response.send_message(status_report)
+# --- SQUAD MANAGEMENT & VIEWING ---
+
+@bot.tree.command(name="viewteam", description="View a club's full squad")
+@app_commands.describe(member="The user whose team you want to see (leave blank for yours)")
+async def viewteam(interaction: discord.Interaction, member: discord.User = None):
+    """Displays a formatted list of all players in a club (Segment 5 request)."""
+    target_user = member if member else interaction.user
+    user_id = target_user.id
+    
+    # 1. Fetch Club Info
+    c.execute("SELECT club_name, formation FROM clubs WHERE user_id = ?", (user_id,))
+    club = c.fetchone()
+    if not club:
+        return await interaction.response.send_message(f"❌ {target_user.name} does not have a club yet.", ephemeral=True)
+
+    # 2. Fetch All Players
+    c.execute("SELECT * FROM players WHERE owner_id = ?", (user_id,))
+    all_players = c.fetchall()
+    
+    if not all_players:
+        return await interaction.response.send_message("This club has no players.", ephemeral=True)
+
+    embed = discord.Embed(
+        title=f"📋 {club[0]} Squad", 
+        description=f"**Tactics:** {club[1]} | **Total Players:** {len(all_players)}",
+        color=discord.Color.blue()
+    )
+
+    # Sort players by status (Starters first, then Bench, then Reserves)
+    # Status: 1=Starter, 2=Bench, 0=Res, 3=Transfer
+    starters = []
+    bench = []
+    reserves = []
+
+    for p in all_players:
+        ovr = calculate_ovr(p)
+        injury = f" 🚑 ({p[6]}d)" if p[6] > 0 else ""
+        p_str = f"`ID:{p[0]}` **{p[2]}** ({p[4]}) - OVR: **{ovr}**{injury}"
+        
+        if p[5] == 1: starters.append(p_str)
+        elif p[5] == 2: bench.append(p_str)
+        else: reserves.append(p_str)
+
+    if starters:
+        embed.add_field(name="👕 Starters (11)", value="\n".join(starters), inline=False)
+    if bench:
+        embed.add_field(name="🧥 Bench", value="\n".join(bench), inline=False)
+    if reserves:
+        # Reserves can be long, so we show the first 10 and a count
+        res_text = "\n".join(reserves[:10])
+        if len(reserves) > 10:
+            res_text += f"\n*...and {len(reserves)-10} more in reserves*"
+        embed.add_field(name="📦 Reserves", value=res_text, inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="set_role", description="Assign a player: 1=Starter, 2=Bench, 0=Reserve")
+@app_commands.describe(player_id="The ID of the player", role="Role number")
+async def set_role(interaction: discord.Interaction, player_id: int, role: int):
+    """Moves players between starters, bench, and reserves."""
+    user_id = interaction.user.id
+    
+    if role not in [0, 1, 2]:
+        return await interaction.response.send_message("❌ Role must be 1 (Starter), 2 (Bench), or 0 (Reserve).", ephemeral=True)
+
+    # Ownership check
+    c.execute("SELECT name, status FROM players WHERE player_id = ? AND owner_id = ?", (player_id, user_id))
+    p = c.fetchone()
+    if not p:
+        return await interaction.response.send_message("❌ Player not found in your club.", ephemeral=True)
+
+    # Limits check
+    if role == 1:
+        c.execute("SELECT COUNT(*) FROM players WHERE owner_id = ? AND status = 1", (user_id,))
+        if c.fetchone()[0] >= 11:
+            return await interaction.response.send_message("❌ You already have 11 starters!", ephemeral=True)
+    elif role == 2:
+        c.execute("SELECT COUNT(*) FROM players WHERE owner_id = ? AND status = 2", (user_id,))
+        if c.fetchone()[0] >= 7:
+            return await interaction.response.send_message("❌ Your bench is full (max 7)!", ephemeral=True)
+
+    c.execute("UPDATE players SET status = ? WHERE player_id = ?", (role, player_id))
+    conn.commit()
+    
+    role_name = ["Reserve", "Starter", "Bench player"][role]
+    await interaction.response.send_message(f"✅ **{p[0]}** is now a **{role_name}**.")
+
+@bot.tree.command(name="formation", description="Change your team's tactical formation")
+async def formation(interaction: discord.Interaction, layout: str):
+    """Simple command to change formation string."""
+    valid = ["4-4-2", "4-3-3", "3-5-2", "5-3-2", "4-2-3-1"]
+    if layout not in valid:
+        return await interaction.response.send_message(f"❌ Invalid. Use: {', '.join(valid)}", ephemeral=True)
+    
+    c.execute("UPDATE clubs SET formation = ? WHERE user_id = ?", (layout, interaction.user.id))
+    conn.commit()
+    await interaction.response.send_message(f"🛡️ Tactics set to **{layout}**!")
+# --- MATCH ENGINE LOGIC ---
+
+@bot.tree.command(name="match", description="Play a match against a random AI opponent")
+async def match(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    now = int(time.time())
+
+    # 1. Fetch User Club & Starters
+    c.execute("SELECT club_name, balance FROM clubs WHERE user_id = ?", (user_id,))
+    club = c.fetchone()
+    if not club:
+        return await interaction.response.send_message("❌ Use `/startmyclub` first!", ephemeral=True)
+
+    c.execute("SELECT * FROM players WHERE owner_id = ? AND status = 1", (user_id,))
+    starters = [list(p) for p in c.fetchall()]
+
+    if len(starters) < 11:
+        return await interaction.response.send_message("❌ You need 11 starters set in `/lineup` to play!", ephemeral=True)
+
+    # 2. Check for Injuries/Training (Availability check)
+    available_starters = []
+    for p in starters:
+        if p[6] > 0: continue # Injured
+        if p[7] > now: continue # Training
+        available_starters.append(p)
+
+    if len(available_starters) < 7:
+        return await interaction.response.send_message("❌ Too many players are injured or training. You need at least 7 available starters.", ephemeral=True)
+
+    # 3. Calculate Team Power
+    team_power = sum(calculate_ovr(p) for p in available_starters) / len(available_starters)
+    ai_power = random.randint(int(team_power - 10), int(team_power + 10))
+
+    # 4. Simulate Match Events
+    my_score = 0
+    ai_score = 0
+    match_log = []
+    
+    # 5 Scoring Opportunities
+    for i in range(5):
+        # User Chance
+        if random.randint(1, 100) < (team_power / 2):
+            scorer = random.choice(available_starters)
+            my_score += 1
+            match_log.append(f"⚽ **GOAL!** {scorer[2]} finds the net!")
+        
+        # AI Chance
+        if random.randint(1, 100) < (ai_power / 2):
+            ai_score += 1
+            match_log.append(f"🥅 **Goal conceded.** The AI scores.")
+
+    # 5. --- INJURY & CARD LOGIC (Your Request) ---
+    injury_event = None
+    for p in available_starters:
+        # 3% chance of injury per match
+        if random.random() < 0.03:
+            days = random.randint(2, 7)
+            c.execute("UPDATE players SET injury_days = ? WHERE player_id = ?", (days, p[0]))
+            injury_event = f"🚑 **INJURY:** {p[2]} went down and is out for **{days} days**!"
+            break # Max 1 injury per match for balance
+
+    # 6. Rewards & Database Updates
+    win_reward = 50000
+    draw_reward = 20000
+    if my_score > ai_score:
+        result_text = f"✅ **Victory!** You won ${win_reward:,}"
+        c.execute("UPDATE clubs SET balance = balance + ? WHERE user_id = ?", (win_reward, user_id))
+    elif my_score == ai_score:
+        result_text = f"🤝 **Draw.** You earned ${draw_reward:,}"
+        c.execute("UPDATE clubs SET balance = balance + ? WHERE user_id = ?", (draw_reward, user_id))
+    else:
+        result_text = "❌ **Defeat.** No prize money awarded."
+
+    conn.commit()
+
+    # 7. Build Embed
+    embed = discord.Embed(title=f"🏟️ Match: {club[0]} vs AI Team", color=discord.Color.blue())
+    embed.add_field(name="Score", value=f"**{my_score} - {ai_score}**", inline=False)
+    
+    if match_log:
+        embed.add_field(name="Highlights", value="\n".join(match_log[:5]), inline=False)
+    else:
+        embed.add_field(name="Highlights", value="A quiet game with no major chances.", inline=False)
+
+    if injury_event:
+        embed.add_field(name="Medical Room", value=injury_event, inline=False)
+
+    embed.set_footer(text=result_text)
+    await interaction.response.send_message(embed=embed)
+        # Deduct money
+    c.execute("UPDATE clubs SET balance = balance - ? WHERE user_id = ?", (cost, user_id))
+    conn.commit()
+
+    await interaction.response.send_message(f"🕵️ You hired a **{rating}-Star Scout** for **${cost:,}**! Use `/scout` to see their findings.")
+
+@bot.tree.command(name="scout", description="Use your hired scout to find a player")
+async def scout(interaction: discord.Interaction):
+    # This generates a 'hidden' player. The scout rating determines how much info you see.
+    # For now, it generates 3 random prospects for the user to choose one to sign.
+    
+    embed = discord.Embed(title="🕵️ Scout's Discovery Report", color=discord.Color.purple())
+    embed.description = "Your scouts found these prospects. Use `/buy [ID]` to sign one!"
+
+    # Generate 3 new Free Agents specifically for this scouting mission
+    for _ in range(3):
+        pos = random.choice(['ST', 'CM', 'CB', 'GK'])
+        # Scouts find younger players (16-19)
+        generate_player(0, position=pos) 
+        
+        # Get the ID of the player just created
+        c.execute("SELECT player_id, name, position FROM players WHERE owner_id = 0 ORDER BY player_id DESC LIMIT 1")
+        p = c.fetchone()
+        
+        embed.add_field(name=f"Prospect: {p[1]}", value=f"Pos: {p[2]} | ID: `{p[0]}`", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+# --- LEAGUE SYSTEM ---
+
+@bot.tree.command(name="league_join", description="Register your club in the server league")
+async def league_join(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    guild_id = interaction.guild_id
+    
+    # Check if club exists
+    c.execute("SELECT club_name FROM clubs WHERE user_id = ?", (user_id,))
+    if not c.fetchone():
+        return await interaction.response.send_message("❌ You need a club to join! Use `/startmyclub`.")
+
+    try:
+        c.execute("INSERT INTO leagues (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
+        conn.commit()
+        await interaction.response.send_message(f"🏆 **{interaction.user.name}** has officially entered the league!")
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("ℹ️ You are already registered in this league.")
+
+@bot.tree.command(name="league_table", description="View current standings")
+async def league_table(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    
+    c.execute('''SELECT clubs.club_name, leagues.points, leagues.played, leagues.wins, leagues.draws, leagues.losses 
+                 FROM leagues 
+                 JOIN clubs ON leagues.user_id = clubs.user_id 
+                 WHERE leagues.guild_id = ? 
+                 ORDER BY leagues.points DESC, (leagues.goals_for - leagues.goals_against) DESC''', (guild_id,))
+    
+    standings = c.fetchall()
+    if not standings:
+        return await interaction.response.send_message("🏁 The league is empty. Be the first to join with `/league_join`!")
+
+    table = "```\nPOS | CLUB           | P | W | D | L | PTS\n" + ("-" * 42) + "\n"
+    for i, row in enumerate(standings, 1):
+        name = row[0][:14].ljust(14)
+        table += f"{str(i).ljust(3)} | {name} | {row[2]} | {row[3]} | {row[4]} | {row[5]} | {row[1]}\n"
+    
+    embed = discord.Embed(title=f"🏆 {interaction.guild.name} Standings", description=table + "```", color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+# --- TRANSFER MARKET & RELEASING ---
+
+@bot.tree.command(name="market", description="Browse the Free Agent market")
+async def market(interaction: discord.Interaction):
+    """Lists players with owner_id = 0 (Free Agents)."""
+    # Fetch 10 random free agents to keep the market fresh
+    c.execute("SELECT * FROM players WHERE owner_id = 0 LIMIT 10")
+    agents = c.fetchall()
+    
+    if not agents:
+        return await interaction.response.send_message("🏪 The market is empty! Check back later.", ephemeral=True)
+
+    embed = discord.Embed(title="🏪 Free Agent Market", color=discord.Color.orange())
+    embed.description = "Use `/buy [ID]` to sign a player. Prices depend on **OVR rating**."
+
+    for p in agents:
+        ovr = calculate_ovr(p)
+        price = get_player_price(p[0]) # Get the dynamic price for this specific player
+        embed.add_field(
+            name=f"{p[2]} ({p[4]})", 
+            value=f"ID: `{p[0]}` | OVR: **{ovr}**\nPrice: **${price:,}**", 
+            inline=True
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="transfer_market", description="Browse players listed by other members")
+async def transfer_market(interaction: discord.Interaction):
+    """Lists players with status = 3 (Listed for sale by members)."""
+    c.execute("SELECT player_id, name, position, owner_id FROM players WHERE status = 3")
+    listed = c.fetchall()
+    
+    if not listed:
+        return await interaction.response.send_message("🤝 No members are currently selling players.", ephemeral=True)
+
+    embed = discord.Embed(title="🤝 Member Transfer Market", color=discord.Color.blue())
+    for p in listed:
+        owner = bot.get_user(p[3])
+        owner_name = owner.name if owner else "Unknown Manager"
+        embed.add_field(name=f"{p[1]} ({p[2]})", value=f"ID: `{p[0]}`\nSeller: {owner_name}", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="buy", description="Buy a player from the Free Agent market")
+@app_commands.describe(player_id="The ID of the player to buy")
+async def buy(interaction: discord.Interaction, player_id: int):
+    user_id = interaction.user.id
+    
+    # 1. Check if user has a club
+    c.execute("SELECT balance FROM clubs WHERE user_id = ?", (user_id,))
+    club = c.fetchone()
+    if not club:
+        return await interaction.response.send_message("❌ You need a club first!", ephemeral=True)
+
+    # 2. Check if player is a Free Agent
+    c.execute("SELECT name FROM players WHERE player_id = ? AND owner_id = 0", (player_id,))
+    p = c.fetchone()
+    if not p:
+        return await interaction.response.send_message("❌ This player is not on the Free Agent market.", ephemeral=True)
+
+    # 3. Check Balance with Dynamic Pricing
+    cost = get_player_price(player_id) # Call the logic from Segment 2.1
+    if club[0] < cost:
+        return await interaction.response.send_message(f"❌ You need ${cost:,} to buy this player. Your balance: ${club[0]:,}", ephemeral=True)
+
+    # 4. Complete Transaction
+    c.execute("UPDATE clubs SET balance = balance - ? WHERE user_id = ?", (cost, user_id))
+    c.execute("UPDATE players SET owner_id = ?, status = 0 WHERE player_id = ?", (user_id, player_id))
+    conn.commit()
+
+    await interaction.response.send_message(f"🖋️ **Transaction Complete!** {p[0]} has joined your squad for **${cost:,}**.")
+
+@bot.tree.command(name="release", description="Release a player to the market (No refund)")
+@app_commands.describe(player_id="The ID of the player to release")
+async def release(interaction: discord.Interaction, player_id: int):
+    """Sends a player back to the Free Agent market (owner_id = 0)."""
+    user_id = interaction.user.id
+    
+    c.execute("SELECT name FROM players WHERE player_id = ? AND owner_id = ?", (player_id, user_id))
+    p = c.fetchone()
+    if not p:
+        return await interaction.response.send_message("❌ You don't own this player.", ephemeral=True)
+
+    c.execute("UPDATE players SET owner_id = 0, status = 0 WHERE player_id = ?", (player_id,))
+    conn.commit()
+    
+    await interaction.response.send_message(f"👋 **{p[0]}** has been released and is now a Free Agent.")
+# --- LEAGUE SYSTEM ---
+
+@bot.tree.command(name="league_join", description="Register your club in the server league")
+async def league_join(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    guild_id = interaction.guild_id
+    
+    # Check if club exists
+    c.execute("SELECT club_name FROM clubs WHERE user_id = ?", (user_id,))
+    if not c.fetchone():
+        return await interaction.response.send_message("❌ You need a club to join! Use `/startmyclub`.")
+
+    try:
+        c.execute("INSERT INTO leagues (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id))
+        conn.commit()
+        await interaction.response.send_message(f"🏆 **{interaction.user.name}** has officially entered the league!")
+    except sqlite3.IntegrityError:
+        await interaction.response.send_message("ℹ️ You are already registered in this league.")
+
+@bot.tree.command(name="league_table", description="View current standings")
+async def league_table(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    
+    c.execute('''SELECT clubs.club_name, leagues.points, leagues.played, leagues.wins, leagues.draws, leagues.losses 
+                 FROM leagues 
+                 JOIN clubs ON leagues.user_id = clubs.user_id 
+                 WHERE leagues.guild_id = ? 
+                 ORDER BY leagues.points DESC, (leagues.goals_for - leagues.goals_against) DESC''', (guild_id,))
+    
+    standings = c.fetchall()
+    if not standings:
+        return await interaction.response.send_message("🏁 The league is empty. Be the first to join with `/league_join`!")
+
+    table = "```\nPOS | CLUB           | P | W | D | L | PTS\n" + ("-" * 42) + "\n"
+    for i, row in enumerate(standings, 1):
+        name = row[0][:14].ljust(14)
+        table += f"{str(i).ljust(3)} | {name} | {row[2]} | {row[3]} | {row[4]} | {row[5]} | {row[1]}\n"
+    
+    embed = discord.Embed(title=f"🏆 {interaction.guild.name} Standings", description=table + "```", color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+# --- MAINTENANCE TASK (The 1 Month = 1 Year logic) ---
+
+@tasks.loop(hours=24)
+async def daily_maintenance():
+    """Runs once a day to handle injuries and ageing."""
+    now_date = datetime.now()
+    
+    # 1. Heal Injuries (Reduces days by 1 every 24h)
+    c.execute("UPDATE players SET injury_days = MAX(0, injury_days - 1)")
+    
+    # 2. Monthly Ageing (On the 1st of every month, everyone ages 1 year)
+    if now_date.day == 1:
+        print("📅 New Month! Processing ageing and retirement...")
+        c.execute("SELECT player_id, name, age FROM players")
+        all_players = c.fetchall()
+        
+        for p_id, p_name, p_age in all_players:
+            new_age = p_age + 1
+            # Check for retirement (Logic defined in Segment 2)
+            if process_retirement(p_id, p_name, new_age):
+                continue # Player deleted, skip update
+            
+            c.execute("UPDATE players SET age = ? WHERE player_id = ?", (new_age, p_id))
+            
+    # 3. Clean up old Free Agents (Removes non-owned players over age 35)
+    c.execute("DELETE FROM players WHERE owner_id = 0 AND age > 35")
+    
+    conn.commit()
+    print(f"✅ Maintenance Complete: {now_date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+# --- GLOBAL ERROR HANDLING ---
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"⏳ Wait {error.retry_after:.1f}s before trying again.", ephemeral=True)
+    elif isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+    else:
+        print(f"Error: {error}")
+        # traceback.print_exc() # Uncomment for debugging
+        if not interaction.response.is_done():
+            await interaction.response.send_message("⚠️ An error occurred processing your command.", ephemeral=True)
+# --- ADMIN LEAGUE CONTROLS ---
+
+@bot.tree.command(name="admin_force_result", description="Admin Only: Manually record a league match score")
+@app_commands.describe(winner="The winning user", loser="The losing user", score="Format: 3-1")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_force_result(interaction: discord.Interaction, winner: discord.User, loser: discord.User, score: str):
+    """Updates the league table with an official result."""
+    guild_id = interaction.guild_id
+    
+    try:
+        w_goals, l_goals = map(int, score.split('-'))
+    except:
+        return await interaction.response.send_message("❌ Invalid format. Use '3-1'.", ephemeral=True)
+
+    # 1. Update Winner Stats
+    c.execute('''UPDATE leagues SET 
+                 points = points + 3, played = played + 1, wins = wins + 1, 
+                 goals_for = goals_for + ?, goals_against = goals_against + ? 
+                 WHERE guild_id = ? AND user_id = ?''', (w_goals, l_goals, guild_id, winner.id))
+    
+    # 2. Update Loser Stats
+    c.execute('''UPDATE leagues SET 
+                 played = played + 1, losses = losses + 1, 
+                 goals_for = goals_for + ?, goals_against = goals_against + ? 
+                 WHERE guild_id = ? AND user_id = ?''', (l_goals, w_goals, guild_id, loser.id))
+    
+    conn.commit()
+    await interaction.response.send_message(f"✅ **Official Result Recorded:** {winner.name} **{score}** {loser.name}")
+
+@bot.tree.command(name="admin_draw", description="Admin Only: Record a league draw")
+@app_commands.describe(user1="First player", user2="Second player", score="Format: 1-1")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_draw(interaction: discord.Interaction, user1: discord.User, user2: discord.User, score: str):
+    """Updates the league table for a draw."""
+    guild_id = interaction.guild_id
+    try:
+        goals = int(score.split('-')[0])
+    except:
+        return await interaction.response.send_message("❌ Invalid format. Use '1-1'.", ephemeral=True)
+
+    # Update both players
+    for user in [user1, user2]:
+        c.execute('''UPDATE leagues SET 
+                     points = points + 1, played = played + 1, draws = draws + 1, 
+                     goals_for = goals_for + ?, goals_against = goals_against + ? 
+                     WHERE guild_id = ? AND user_id = ?''', (goals, goals, guild_id, user.id))
+    
+    conn.commit()
+    await interaction.response.send_message(f"🤝 **Official Draw Recorded:** {user1.name} and {user2.name} drew **{score}**")
+
+@bot.tree.command(name="admin_reset_league", description="Admin Only: Wipe the standings for a new season")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_reset_league(interaction: discord.Interaction):
+    """Deletes all standings for the current server."""
+    c.execute("DELETE FROM leagues WHERE guild_id = ?", (interaction.guild_id,))
+    conn.commit()
+    await interaction.response.send_message("🧹 **Season Reset:** The league table has been cleared!")
+
+# --- FINAL EXECUTION BLOCK ---
+
+if __name__ == "__main__":
+    # REPLACE 'YOUR_TOKEN_HERE' WITH YOUR ACTUAL BOT TOKEN
+    # bot.run('YOUR_TOKEN_HERE')
+    print("Bot script is ready! Ensure you paste your token above.")
+
+
